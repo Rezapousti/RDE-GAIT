@@ -1,0 +1,1037 @@
+function RDE_GAIT_main
+% RDE-GAIT single-leg, auto-calibrating (MAT + APDM)
+
+    [files, folder] = uigetfile( ...
+        {'*.mat;*.h5','IMU files (*.mat, *.h5)'; ...
+         '*.*','All files'}, ...
+        'Select IMU .mat or APDM .h5 file(s)', ...
+        'MultiSelect','on');
+    if isequal(files,0)
+        return;
+    end
+    if ischar(files)
+        files = {files};
+    end
+
+    out_dir = uigetdir(pwd, 'Select output folder');
+    if isequal(out_dir,0)
+        return;
+    end
+
+    prompt = { ...
+        'Ankle sensor name contains (MAT: e.g., "IMU 3 (left ankle)"; APDM: left/right/lumbar or ID):', ...
+        'Reference mode (waist_full [default], world, waist_yaw):', ...
+        'Baseline mode (rolling [default] or trimmed):'};
+    dlgtitle = 'RDE-GAIT settings';
+    definput = { 'IMU 3 (left ankle)', 'waist_full', 'rolling' };
+    answer = inputdlg(prompt, dlgtitle, 1, definput);
+    if isempty(answer)
+        return;
+    end
+
+    ankle_hint = strtrim(answer{1});
+    ref = lower(strtrim(answer{2}));
+    if ~ismember(ref, {'world','waist_yaw','waist_full'})
+        ref = 'waist_full';
+    end
+
+    mode = lower(strtrim(answer{3}));
+    if ~ismember(mode, {'rolling','trimmed'})
+        mode = 'rolling';
+    end
+
+    cfg = RDEConfig();
+    cfg.baseline_mode = mode;
+
+    for i = 1:numel(files)
+        fpath = fullfile(folder, files{i});
+        try
+            ankle_arg = ankle_hint;
+            if endsWith(lower(fpath), '.h5') && strcmp(ankle_hint, 'IMU 3 (left ankle)')
+                ankle_arg = 'left';  % APDM logical name
+            end
+            compute_rde(fpath, out_dir, ankle_arg, cfg, ref);
+        catch ME
+            fprintf('[ERROR] %s: %s\n', files{i}, ME.message);
+        end
+    end
+
+    fprintf('\nDone.\n');
+end
+
+
+% =====================================================================
+% Configuration
+% =====================================================================
+function cfg = RDEConfig()
+    cfg.tau_min_frac   = 0.10;
+    cfg.comp_alpha     = 0.02;
+    cfg.baseline_mode  = 'rolling';  % default baseline
+    cfg.trim_frac      = 0.10;
+    cfg.rolling_window = 200;
+end
+
+
+% =====================================================================
+% Core compute function
+% =====================================================================
+function compute_rde(file_path, out_dir, ankle_name, cfg, reference_mode)
+    fprintf('\n=== Processing: %s ===\n', get_filename(file_path));
+
+    imud = load_imu_mat(file_path);
+    fs   = imud.fs;
+    t    = imud.t(:);
+
+    % APDM convenience: default to 'left' if ankle_name is LSIE-style label
+    if endsWith(lower(file_path), '.h5') && strcmp(ankle_name, 'IMU 3 (left ankle)')
+        ankle_name = 'left';
+    end
+
+    % Ankle triads
+    ankle = extract_sensor(imud, ankle_name);
+    if ~isempty(ankle.mag)
+        Nsmooth = max(1, round(fs * 0.25));
+        ankle.mag = movmean(ankle.mag, Nsmooth, 1, 'Endpoints','shrink');
+    end
+
+    % Orientation (ankle)
+    q_a = comp_filter(ankle.accel, ankle.gyro, ankle.mag, fs, cfg.comp_alpha);
+    Rw_a = zeros(3,3,size(q_a,1));
+    for k = 1:size(q_a,1)
+        Rw_a(:,:,k) = quat_to_R(q_a(k,:));
+    end
+
+    % Unit shank axis in sensor frame
+    u_sensor = estimate_unit_shank_axis_sensor(ankle.accel, ankle.gyro, fs);
+
+    % Leg vector in world frame (ankle-only)
+    N = size(q_a,1);
+    r_unit_world = zeros(N,3);
+    for k = 1:N
+        r_unit_world(k,:) = (Rw_a(:,:,k) * u_sensor(:)).';
+    end
+
+    % Optional waist reference (APDM only)
+    waist_info = struct();
+    r_ref = r_unit_world;
+    if (strcmp(reference_mode,'waist_yaw') || strcmp(reference_mode,'waist_full')) ...
+            && endsWith(lower(file_path), '.h5')
+        try
+            waist = extract_sensor(imud, 'lumbar');  % 13378 via APDM map
+            if ~isempty(waist.mag)
+                Nsmooth = max(1, round(fs * 0.25));
+                waist.mag = movmean(waist.mag, Nsmooth, 1, 'Endpoints','shrink');
+            end
+            q_w = comp_filter(waist.accel, waist.gyro, waist.mag, fs, cfg.comp_alpha);
+
+            APDM_ID_MAP = apdm_id_map();
+            waist_info.waist_sensor_id = APDM_ID_MAP.lumbar;
+
+            if strcmp(reference_mode,'waist_yaw')
+                yaws = yaw_from_quat_seq(q_w);
+                r_ref = zeros(size(r_unit_world));
+                for i = 1:N
+                    Rz = rotz(-yaws(i));
+                    r_ref(i,:) = (Rz * r_unit_world(i,:).').';
+                end
+            else
+                % waist_full: transform into waist frame
+                r_ref = zeros(size(r_unit_world));
+                for i = 1:N
+                    Rw = quat_to_R(q_w(i,:)); % world_from_waist
+                    r_ref(i,:) = (Rw.' * r_unit_world(i,:).').';
+                end
+            end
+        catch ME
+            fprintf('[WARN] Waist reference requested but failed: %s. Using world.\n', ME.message);
+            reference_mode = 'world';
+            r_ref = r_unit_world;
+        end
+    end
+
+    % Leg angle in chosen reference
+    y_unit = r_ref(:,2);
+    theta = acos( max(-1, min(1, y_unit ./ (vecnorm(r_ref,2,2) + 1e-12))) );
+    theta = lp(theta, fs, 6.0);
+
+    % HS/TO events
+    [HS, TO] = detect_HS_TO(ankle.gyro, fs);
+    if numel(HS) < 3 || numel(TO) < 2
+        fprintf('Not enough HS/TO events detected; try a different recording.\n');
+        return;
+    end
+
+    % Hybrid leg-length estimate
+    h_est = estimate_leg_length_hybrid(theta, fs, HS, TO, [0.50 1.10]);
+
+    % Final r(t)
+    r_world = r_ref * h_est;
+    x  = r_world(:,1);
+    yv = r_world(:,2);
+    z  = r_world(:,3);
+    rho   = sqrt(x.^2 + z.^2);
+    rho_lp = lp(rho, fs, 6.0);
+    y_lp   = lp(yv, fs, 6.0);
+
+    % Per-cycle hits and features
+    rows = [];
+    idx_row = 0;
+    nCycles = min(numel(HS) - 1, numel(TO));
+
+    for k = 1:nCycles
+        hs0 = HS(k);
+        hs1 = HS(k+1);
+        to0 = TO(k);
+        if ~(hs0 < to0 && to0 < hs1)
+            continue;
+        end
+        sl = hs0:hs1;
+        rho_c = rho_lp(sl);
+        RT = max(rho_c) - min(rho_c);
+        if RT <= 1e-6
+            continue;
+        end
+
+        % posterior: hs0→to0 ; anterior: to0→hs1
+        [iA, rhoA, yA, thA] = pick_hit(hs0, hs1, to0, rho_lp, y_lp, theta, fs, 'A');
+        [iP, rhoP, yP, thP] = pick_hit(hs0, hs1, to0, rho_lp, y_lp, theta, fs, 'P');
+
+        y_stance = prctile(y_lp(sl), 10);
+        tauA = yA - y_stance;
+        tauP = yP - y_stance;
+
+        zA = z(iA);
+        zP = z(iP);
+
+        idx_row = idx_row + 1;
+        rows(idx_row).cycle   = k;             %#ok<AGROW>
+        rows(idx_row).t_HS0   = t(hs0);
+        rows(idx_row).t_TO    = t(to0);
+        rows(idx_row).t_HS1   = t(hs1);
+        rows(idx_row).rho_A   = rhoA;
+        rows(idx_row).tau_A   = tauA;
+        rows(idx_row).theta_A = thA;
+        rows(idx_row).ml_A    = zA;
+        rows(idx_row).rho_P   = -rhoP;
+        rows(idx_row).tau_P   = -tauP;
+        rows(idx_row).theta_P = -thP;
+        rows(idx_row).ml_P    = zP;
+        rows(idx_row).RT      = RT;
+    end
+
+    if isempty(rows)
+        fprintf('No valid cycles extracted.\n');
+        return;
+    end
+
+    df = struct2table(rows);
+
+    % Equilibrium index
+    w_rho = 1 ./ MAD([df.rho_A; df.rho_P]);
+    w_tau = 1 ./ MAD([df.tau_A; df.tau_P]);
+    w_th  = 1 ./ MAD([df.theta_A; df.theta_P]);
+
+    nRows = height(df);
+    vA  = zeros(nRows,3);
+    vPm = zeros(nRows,3);
+
+    for i = 1:nRows
+        vA(i,:)  = norm_triplet(df.rho_A(i),  df.tau_A(i),  df.theta_A(i),  w_rho, w_tau, w_th);
+        vPm(i,:) = norm_triplet(-df.rho_P(i), -df.tau_P(i), -df.theta_P(i), w_rho, w_tau, w_th);
+    end
+
+    cosang = sum(vA .* vPm, 2);
+    p = (1 + cosang) / 2;
+
+    % Robust baseline p0 (rolling or trimmed)
+    if strcmpi(cfg.baseline_mode,'rolling')
+        win = max(5, round(cfg.rolling_window));
+        p0_arr = movmedian(p, win, 'omitnan', 'Endpoints','shrink');
+        lohi = prctile(p, [100*cfg.trim_frac, 100*(1-cfg.trim_frac)]);
+        mask = p >= lohi(1) & p <= lohi(2);
+        if any(mask)
+            globalTrimMed = median(p(mask));
+        else
+            globalTrimMed = median(p);
+        end
+        p0_arr(~isfinite(p0_arr)) = globalTrimMed;
+        E = p ./ (p0_arr + 1e-12);
+    else
+        lohi = prctile(p, [100*cfg.trim_frac, 100*(1-cfg.trim_frac)]);
+        mask = p >= lohi(1) & p <= lohi(2);
+        if any(mask)
+            p0 = median(p(mask));
+        else
+            p0 = median(p);
+        end
+        E = p ./ (p0 + 1e-12);
+    end
+
+    df.cosine = cosang;
+    df.p      = p;
+    df.E      = E;
+
+    cls = repmat("consistent", nRows, 1);
+    cls(E < 0.95) = "inconsistent";
+    cls(E > 1.05) = "semi-consistent";
+    df.class = cls;
+
+    % Save CSV + JSON + plot
+    base = get_basename(file_path);
+    csv_path  = fullfile(out_dir, [base '__RDE-GAIT_cycles.csv']);
+    json_path = fullfile(out_dir, [base '__RDE-GAIT_summary.json']);
+    png_path  = fullfile(out_dir, [base '__RDE-GAIT_plots.png']);
+    writetable(df, csv_path);
+
+    shank_axis = estimate_unit_shank_axis_sensor(ankle.accel, ankle.gyro, fs);
+    E_median = median(E);
+    E_IQR    = prctile(E,75) - prctile(E,25);
+
+    counts.consistent      = sum(df.class == "consistent");
+    counts.semi_consistent = sum(df.class == "semi-consistent");
+    counts.inconsistent    = sum(df.class == "inconsistent");
+
+    weights.w_rho   = w_rho;
+    weights.w_tau   = w_tau;
+    weights.w_theta = w_th;
+
+    baseline.mode           = cfg.baseline_mode;
+    baseline.trim_frac      = cfg.trim_frac;
+    baseline.rolling_window = cfg.rolling_window;
+
+    summary.file              = file_path;
+    summary.fs                = fs;
+    summary.n_cycles          = height(df);
+    summary.leg_length_est_m  = h_est;
+    summary.shank_axis_sensor = shank_axis(:).';
+    summary.E_median          = E_median;
+    summary.E_IQR             = E_IQR;
+    summary.counts            = counts;
+    summary.weights           = weights;
+    summary.baseline          = baseline;
+    summary.reference_mode    = reference_mode;
+
+    if ~isempty(fieldnames(waist_info))
+        fns = fieldnames(waist_info);
+        for i = 1:numel(fns)
+            summary.(fns{i}) = waist_info.(fns{i});
+        end
+    end
+
+    json_str = jsonencode(summary, 'PrettyPrint',true);
+    fid = fopen(json_path, 'w');
+    if fid ~= -1
+        fwrite(fid, json_str, 'char');
+        fclose(fid);
+    end
+
+    plot_rde(df, png_path, summary, cfg);
+
+    fprintf('Saved:\n  %s\n  %s\n  %s\n', csv_path, json_path, png_path);
+    fprintf('Hybrid h = %.3f m; baseline mode = %s; reference = %s\n', ...
+        h_est, cfg.baseline_mode, reference_mode);
+end
+
+
+% =====================================================================
+% Plotting
+% =====================================================================
+function plot_rde(df, out_png, summary, cfg) %#ok<INUSD>
+    cyc   = df.cycle;
+    E     = df.E;
+    cos   = df.cosine;
+    alpha = rad2deg(acos(max(-1,min(1,cos))));
+    cls   = df.class;
+
+    [medE, q10E, q90E] = running_stats(E, 201);
+
+    C.consistent      = [0.85 0.28 0.94];
+    C.inconsistent    = [0.58 0.64 0.70];
+    C.semi_consistent = [0.55 0.37 0.24];
+
+    figure('Visible','off','Position',[100 100 1200 700]);
+    tiledlayout(3,4,'Padding','compact','TileSpacing','compact');
+
+    % E panel
+    nexttile([1 4]);
+    hold on;
+    fill_x = [cyc; flipud(cyc)];
+    fill_y = [q10E; flipud(q90E)];
+    fill(fill_x, fill_y, [1 0.62 0.62], 'FaceAlpha',0.6, 'EdgeColor','none');
+    plot(cyc, E, 'Color',[0.15 0.39 0.92], 'LineWidth',0.5);
+    if any(isfinite(medE))
+        plot(cyc, medE, 'Color',[0.07 0.09 0.15], 'LineWidth',1.2);
+    end
+    yline(1.0, '--', 'Color',[0.42 0.45 0.50], 'LineWidth',1.0);
+    ylabel('E');
+    title('RDE-GAIT Equilibrium per cycle (E)');
+    hold off;
+
+    % Alpha histogram
+    nexttile([1 3]);
+    bins = linspace(0, max(30, prctile(alpha,99)), 40);
+    hold on;
+    classes = ["consistent","inconsistent","semi-consistent"];
+    for i = 1:numel(classes)
+        mask = (cls == classes(i));
+        if ~any(mask)
+            continue;
+        end
+        ci = C.(strrep(classes(i),'-','_'));
+        h = histogram(alpha(mask), bins, 'FaceColor',ci, 'EdgeColor','none');
+        if classes(i) == "inconsistent"
+            h.FaceAlpha = 0.5;
+        else
+            h.FaceAlpha = 0.6;
+        end
+    end
+    xlabel('\alpha (deg)');
+    ylabel('count');
+    title('Mirror error angle \alpha distribution');
+    hold off;
+    legend(classes, 'Location','best','Interpreter','none');
+
+    % Stats box
+    nexttile;
+    axis off;
+    cnts = summary.counts;
+    txt = {
+        sprintf('Baseline: %s (trim=%.2f)', summary.baseline.mode, summary.baseline.trim_frac)
+        sprintf('h (hybrid): %.3f m', summary.leg_length_est_m)
+        sprintf('cycles: %d', summary.n_cycles)
+        sprintf('E median / IQR: %.3f / %.3f', summary.E_median, summary.E_IQR)
+        sprintf('consistent:      %d', cnts.consistent)
+        sprintf('inconsistent:    %d', cnts.inconsistent)
+        sprintf('semi-consistent: %d', cnts.semi_consistent)
+        sprintf('reference: %s', summary.reference_mode)
+        };
+    if isfield(summary,'waist_sensor_id')
+        txt{end+1} = sprintf('waist ID: %s', summary.waist_sensor_id);
+    end
+    text(0.02, 0.98, txt, 'VerticalAlignment','top');
+
+    % Scatter helper
+    function scatter_by_class(x, y, xlabelStr, ylabelStr)
+        hold on;
+        for j = 1:numel(classes)
+            mask = (cls == classes(j));
+            if ~any(mask), continue; end
+            ci = C.(strrep(classes(j),'-','_'));
+            sz = 10;
+            if classes(j) ~= "consistent"
+                sz = 12;
+            end
+            alphaVal = 0.55;
+            if classes(j) == "inconsistent"
+                alphaVal = 0.45;
+            end
+            scatter(x(mask), y(mask), sz, ...
+                'MarkerEdgeColor','none', 'MarkerFaceColor',ci, ...
+                'MarkerFaceAlpha', alphaVal);
+        end
+        mn = min([x; y]);
+        mx = max([x; y]);
+        plot([mn mx], [mn mx], '--', 'Color',[0.61 0.64 0.69], 'LineWidth',1.0);
+        xlabel(xlabelStr);
+        ylabel(ylabelStr);
+        xlim([mn mx]);
+        ylim([mn mx]);
+        hold off;
+    end
+
+    % rho scatter
+    nexttile;
+    scatter_by_class(df.rho_A, -df.rho_P, 'rho_A', 'rho_P mirrored');
+
+    % tau scatter
+    nexttile;
+    scatter_by_class(df.tau_A, -df.tau_P, 'tau_A', 'tau_P mirrored');
+
+    % theta scatter
+    nexttile;
+    scatter_by_class(df.theta_A, -df.theta_P, 'theta_A', 'theta_P mirrored');
+
+    % empty tile
+    nexttile;
+    axis off;
+
+    sgtitle('RDE-GAIT — Equilibrium & Mirror Symmetry');
+    exportgraphics(gcf, out_png, 'Resolution',170);
+    close(gcf);
+end
+
+
+% =====================================================================
+% Small helpers
+% =====================================================================
+function y = bp(x, fs, lo, hi, order)
+    if nargin < 5, order = 4; end
+    ny = 0.5 * fs;
+    [b,a] = butter(order, [lo hi]/ny, 'bandpass');
+    y = filtfilt(b,a,x);
+end
+
+function y = lp(x, fs, cutoff, order)
+    if nargin < 4, order = 4; end
+    ny = 0.5 * fs;
+    [b,a] = butter(order, cutoff/ny, 'low');
+    y = filtfilt(b,a,x);
+end
+
+function APDM = apdm_id_map()
+    APDM.left   = '13340';
+    APDM.right  = '13350';
+    APDM.lumbar = '13378';
+end
+
+function mag = gyromag(g)
+    mag = vecnorm(g,2,2);
+end
+
+function m = stance_mask(gyro, fs, thr, min_dur)
+    if nargin < 3, thr = 0.35; end
+    if nargin < 4, min_dur = 0.3; end
+    mgyro = gyromag(gyro);
+    raw = double(mgyro < thr);
+    K = max(1, round(min_dur * fs));
+    sm = movmean(raw, K, 1, 'Endpoints','shrink');
+    m = sm > 0.8;
+end
+
+function u = estimate_unit_shank_axis_sensor(acc, gyro, fs)
+    mask = stance_mask(gyro, fs);
+    if sum(mask) < fs
+        gvec = mean(acc, 1);
+    else
+        gvec = mean(acc(mask,:), 1);
+    end
+    u = -gvec(:) ./ (norm(gvec) + 1e-12);
+end
+
+function idx = primary_gyro_axis(gyro, fs)
+    powb = zeros(3,1);
+    for i = 1:3
+        [P,f] = pwelch(gyro(:,i), min(4096,length(gyro)), [], [], fs);
+        band = (f>=0.5 & f<=3.0);
+        powb(i) = sum(P(band));
+    end
+    [~, idx] = max(powb);
+end
+
+function [HS, TO] = detect_HS_TO(gyro, fs)
+    % Detect HS and TO from the dominant gyro axis, without MinPeakDistance.
+    idx = primary_gyro_axis(gyro, fs);
+    sig = bp(gyro(:,idx), fs, 0.5, 6.0, 4);
+
+    prom = std(sig) * 0.5;
+
+    % Peaks for TO (positive) and HS (negative)
+    [~, loc_to] = findpeaks(sig,  'MinPeakProminence', prom);
+    [~, loc_hs] = findpeaks(-sig, 'MinPeakProminence', prom);
+
+    HS = sort(loc_hs(:));
+    TO = sort(loc_to(:));
+
+    % Pair HS/TO: one TO between consecutive HS events
+    hs_list = [];
+    to_list = [];
+    j = 0;
+
+    for k = 1:(numel(HS)-1)
+        hs0 = HS(k);
+        hs1 = HS(k+1);
+
+        while j < numel(TO) && TO(j+1) <= hs0
+            j = j + 1;
+        end
+
+        if j < numel(TO) && hs0 < TO(j+1) && TO(j+1) < hs1
+            hs_list(end+1,1) = hs0;      %#ok<AGROW>
+            to_list(end+1,1) = TO(j+1);  %#ok<AGROW>
+        end
+    end
+
+    HS = hs_list;
+    TO = to_list;
+end
+
+function h = estimate_leg_length_from_theta_freq(theta, fs, bounds)
+    if nargin < 3
+        bounds = [0.50 1.10];
+    end
+    g = 9.80665;
+    [Pxx,f] = pwelch(theta, min(4096,length(theta)), [], [], fs);
+    band = (f>=0.4 & f<=1.2);
+    if ~any(band) || sum(Pxx(band)) == 0
+        h = 0.85;
+        return;
+    end
+    fb = f(band);
+    Pb = Pxx(band);
+    [~,idx] = max(Pb);
+    fpk = fb(idx);
+    h_val = g / ((2*pi*fpk)^2 + 1e-12);
+    h = min(max(h_val, bounds(1)), bounds(2));
+end
+
+function h = estimate_leg_length_hybrid(theta, fs, HS, TO, bounds)
+    if nargin < 5
+        bounds = [0.50 1.10];
+    end
+    g = 9.80665;
+    th = lp(theta, fs, 8.0);
+    dt = 1/fs;
+    dth = gradient(th, dt);
+    dth = lp(dth, fs, 8.0);
+
+    h_vals = [];
+    nwin = min(numel(HS)-1, numel(TO));
+    for k = 1:nwin
+        hs0 = HS(k);
+        hs1 = HS(k+1);
+        to0 = TO(k);
+        segs = [hs0 to0; to0 hs1];
+        for s = 1:size(segs,1)
+            s0 = segs(s,1);
+            s1 = segs(s,2);
+            if ~(s0>=1 && s1<=numel(th) && s0<s1)
+                continue;
+            end
+            seg_th  = th(s0:s1);
+            seg_dth = dth(s0:s1);
+            if numel(seg_th) < max(5, round(0.1*fs))
+                continue;
+            end
+            th_max = max(seg_th);
+            th_min = min(seg_th);
+            cosdiff = cos(th_min) - cos(th_max);
+            wmax = max(abs(seg_dth));
+            if cosdiff <= 1e-4 || wmax <= 1e-3
+                continue;
+            end
+            h_i = (2*g*cosdiff) / (wmax^2 + 1e-12);
+            if h_i>=0.35 && h_i<=1.40
+                h_vals(end+1,1) = h_i; %#ok<AGROW>
+            end
+        end
+    end
+
+    if numel(h_vals) >= 30
+        lohi = prctile(h_vals, [10 90]);
+        trimmed = h_vals(h_vals>=lohi(1) & h_vals<=lohi(2));
+        if numel(trimmed) >= 10
+            h_med = median(trimmed);
+            h = min(max(h_med, bounds(1)), bounds(2));
+            return;
+        end
+    end
+
+    h = estimate_leg_length_from_theta_freq(theta, fs, bounds);
+end
+
+function m = MAD(x)
+    med = median(x);
+    m = median(abs(x - med)) + 1e-12;
+end
+
+function v = norm_triplet(r, t, h, w_rho, w_tau, w_th)
+    v = [r*w_rho, t*w_tau, h*w_th];
+    v = v ./ (norm(v) + 1e-12);
+end
+
+function [med, q10, q90] = running_stats(x, win)
+    if nargin < 2
+        win = 201;
+    end
+    med = movmedian(x, win, 'omitnan', 'Endpoints','shrink');
+    q10 = movprctile(x, 10, win);
+    q90 = movprctile(x, 90, win);
+end
+
+function y = movprctile(x, p, win)
+    y = movfun(@(v) prctile(v,p), x, win);
+end
+
+function y = movfun(fun, x, win)
+    n = numel(x);
+    y = NaN(size(x));
+    half = floor(win/2);
+    for i = 1:n
+        i0 = max(1, i-half);
+        i1 = min(n, i+half);
+        seg = x(i0:i1);
+        seg = seg(isfinite(seg));
+        if numel(seg) >= max(3, floor(win/4))
+            y(i) = fun(seg);
+        end
+    end
+end
+
+function q = euler_to_quat(roll, pitch, yaw)
+    cr = cos(roll/2);  sr = sin(roll/2);
+    cp = cos(pitch/2); sp = sin(pitch/2);
+    cy = cos(yaw/2);   sy = sin(yaw/2);
+    w = cy*cp*cr + sy*sp*sr;
+    x = cy*cp*sr - sy*sp*cr;
+    y = sy*cp*sr + cy*sp*cr;
+    z = sy*cp*cr - cy*sp*sr;
+    q = [w x y z];
+end
+
+function q = quat_from_gyro(omega, dt)
+    ang = norm(omega)*dt;
+    if ang < 1e-9
+        q = [1 0 0 0];
+        return;
+    end
+    ax = omega(:) / (norm(omega)+1e-12);
+    s = sin(ang/2);
+    q = [cos(ang/2) ax(1)*s ax(2)*s ax(3)*s];
+end
+
+function q = quat_mul(q1, q2)
+    w1=q1(1); x1=q1(2); y1=q1(3); z1=q1(4);
+    w2=q2(1); x2=q2(2); y2=q2(3); z2=q2(4);
+    q = [ ...
+        w1*w2 - x1*x2 - y1*y2 - z1*z2, ...
+        w1*x2 + x1*w2 + y1*z2 - z1*y2, ...
+        w1*y2 - x1*z2 + y1*w2 + z1*x2, ...
+        w1*z2 + x1*y2 - y1*x2 + z1*w2 ];
+end
+
+function q = quat_norm(q)
+    q = q / (norm(q)+1e-12);
+end
+
+function [roll, pitch] = acc_to_roll_pitch(ax, ay, az)
+    roll  = atan2(ay, az);
+    pitch = atan2(-ax, sqrt(ay.^2 + az.^2));
+end
+
+function yaw = tiltcomp_yaw(mx, my, mz, roll, pitch)
+    cr = cos(roll);  sr = sin(roll);
+    cp = cos(pitch); sp = sin(pitch);
+    mx2 = mx*cp + mz*sp;
+    my2 = mx*sr*sp + my*cr - mz*sr*cp;
+    yaw = atan2(-my2, mx2);
+end
+
+function a = ang_wrap(a)
+    a = mod(a+pi, 2*pi) - pi;
+end
+
+function q = comp_filter(acc, gyro, mag, fs, alpha)
+    if nargin < 5
+        alpha = 0.02;
+    end
+    N = size(acc,1);
+    q = zeros(N,4);
+    dt = 1/fs;
+
+    [r0,p0] = acc_to_roll_pitch(acc(1,1), acc(1,2), acc(1,3));
+    if ~isempty(mag)
+        y0 = tiltcomp_yaw(mag(1,1), mag(1,2), mag(1,3), r0, p0);
+    else
+        y0 = 0;
+    end
+    q(1,:) = quat_norm(euler_to_quat(r0,p0,y0));
+
+    for k = 2:N
+        qpred = quat_norm(quat_mul(q(k-1,:), quat_from_gyro(gyro(k,:), dt)));
+        R = quat_to_R(qpred);
+        yaw_p   = atan2(R(2,1), R(1,1));
+        pitch_p = asin(-R(3,1));
+        roll_p  = atan2(R(3,2), R(3,3));
+
+        [rA,pA] = acc_to_roll_pitch(acc(k,1), acc(k,2), acc(k,3));
+        if ~isempty(mag)
+            yA = tiltcomp_yaw(mag(k,1), mag(k,2), mag(k,3), rA, pA);
+        else
+            yA = yaw_p;
+        end
+
+        er = ang_wrap(rA - roll_p);
+        ep = ang_wrap(pA - pitch_p);
+        ey = ang_wrap(yA - yaw_p);
+        qc = euler_to_quat(er*alpha, ep*alpha, ey*alpha);
+        q(k,:) = quat_norm(quat_mul(qc, qpred));
+    end
+end
+
+function R = quat_to_R(q)
+    w = q(1); x = q(2); y = q(3); z = q(4);
+    R = [ ...
+        1-2*(y^2+z^2), 2*(x*y - z*w), 2*(x*z + y*w); ...
+        2*(x*y + z*w), 1-2*(x^2+z^2), 2*(y*z - x*w); ...
+        2*(x*z - y*w), 2*(y*z + x*w), 1-2*(x^2+y^2) ];
+end
+
+function yaw = yaw_from_quat_seq(quat)
+    N = size(quat,1);
+    yaw = zeros(N,1);
+    for i = 1:N
+        R = quat_to_R(quat(i,:));
+        yaw(i) = atan2(R(2,1), R(1,1));
+    end
+end
+
+function R = rotz(angle)
+    c = cos(angle); s = sin(angle);
+    R = [c -s 0; s c 0; 0 0 1];
+end
+
+function imud = load_apdm_h5(path)
+    info = h5info(path, '/Sensors');
+    nSensors = numel(info.Groups);
+    sensor_ids = cell(1,nSensors);
+    for k = 1:nSensors
+        gname = info.Groups(k).Name;  % '/Sensors/13340'
+        parts = strsplit(gname,'/');
+        sensor_ids{k} = parts{end};
+    end
+
+    t_us = double(h5read(path, ['/Sensors/' sensor_ids{1} '/Time']));
+    dt = diff(t_us);
+    med = median(dt);
+    if med <= 0
+        error('APDM H5: Non-positive median time step.');
+    end
+    fs = 1e6/med;
+
+    N = inf;
+    for k = 1:nSensors
+        acc = h5read(path, ['/Sensors/' sensor_ids{k} '/Accelerometer']);
+        N = min(N, size(acc,1));
+    end
+    N = double(N);
+
+    types = { ...
+        'accelDataX','accelDataY','accelDataZ', ...
+        'gyroDataX','gyroDataY','gyroDataZ', ...
+        'magnetDataX','magnetDataY','magnetDataZ'};
+    dataArray = zeros(numel(types), N, nSensors);
+
+    for s = 1:nSensors
+        acc = double(h5read(path, ['/Sensors/' sensor_ids{s} '/Accelerometer']));
+        gyr = double(h5read(path, ['/Sensors/' sensor_ids{s} '/Gyroscope']));
+        acc = acc(1:N,:);
+        gyr = gyr(1:N,:);
+
+        hasMag = false;
+        for d = 1:numel(info.Groups(s).Datasets)
+            if strcmp(info.Groups(s).Datasets(d).Name,'Magnetometer')
+                hasMag = true;
+                break;
+            end
+        end
+        if hasMag
+            mag = double(h5read(path, ['/Sensors/' sensor_ids{s} '/Magnetometer']));
+            mag = mag(1:N,:);
+        else
+            mag = zeros(N,3);
+        end
+
+        dataArray(1:3,:,s) = acc.';
+        dataArray(4:6,:,s) = gyr.';
+        dataArray(7:9,:,s) = mag.';
+    end
+
+    t = t_us(1:N)/1e6;
+    imud.fs         = fs;
+    imud.t          = t(:);
+    imud.sensors    = sensor_ids;
+    imud.types      = types;
+    imud.data_array = dataArray;
+end
+
+function imud = load_imu_mat(path)
+    if endsWith(lower(path), '.h5')
+        imud = load_apdm_h5(path);
+        return;
+    end
+
+    S = load(path);
+    if ~isfield(S,'IMU')
+        error('Unsupported MAT layout: IMU struct not found.');
+    end
+    IMU = S.IMU;
+    fs = double(IMU.samplingRate);
+    dataArray = double(IMU.dataArray);
+    axisValue = IMU.axisValue;
+
+    types   = parse_axis_value_entry(axisValue{1});
+    sensors = parse_axis_value_entry(axisValue{3});
+    N = size(dataArray,2);
+    t = (0:N-1)'/fs;
+
+    imud.fs         = fs;
+    imud.t          = t;
+    imud.sensors    = sensors;
+    imud.types      = types;
+    imud.data_array = dataArray;
+end
+
+function out = parse_axis_value_entry(val)
+    if iscell(val)
+        out = cellfun(@(x)char(x), val, 'UniformOutput',false);
+    elseif ischar(val)
+        s = strtrim(val);
+        if startsWith(s,'[') && endsWith(s,']')
+            try
+                tmp = eval(s); %#ok<EVLDIR>
+                if iscell(tmp)
+                    out = cellfun(@(x)char(x), tmp, 'UniformOutput',false);
+                else
+                    out = cellstr(string(tmp));
+                end
+            catch
+                out = {s};
+            end
+        else
+            out = {s};
+        end
+    else
+        out = {char(string(val))};
+    end
+end
+
+function sensor = extract_sensor(imud, name_substr)
+    APDM_ID_MAP = apdm_id_map();
+    name_substr = char(name_substr);
+    s_idx = [];
+
+    % 1) direct substring match
+    for i = 1:numel(imud.sensors)
+        if contains(lower(imud.sensors{i}), lower(name_substr))
+            s_idx = i; break;
+        end
+    end
+
+    % 2) logical labels (APDM)
+    if isempty(s_idx)
+        key = lower(strtrim(name_substr));
+        if isfield(APDM_ID_MAP, key)
+            target = APDM_ID_MAP.(key);
+            for i = 1:numel(imud.sensors)
+                if strcmp(imud.sensors{i}, target)
+                    s_idx = i; break;
+                end
+            end
+        end
+    end
+
+    % 3) numeric ID with leading '#'
+    if isempty(s_idx)
+        key = strrep(strtrim(name_substr), '#','');
+        for i = 1:numel(imud.sensors)
+            if strcmp(imud.sensors{i}, key)
+                s_idx = i; break;
+            end
+        end
+    end
+
+    % 4) fall back to text inside parentheses, e.g. "IMU 3 (left ankle)" -> "left ankle"
+    if isempty(s_idx)
+        tokens = regexp(name_substr, '\(([^)]*)\)', 'tokens', 'once');
+        if ~isempty(tokens)
+            inside = lower(strtrim(tokens{1}));
+            for i = 1:numel(imud.sensors)
+                if contains(lower(imud.sensors{i}), inside)
+                    s_idx = i; break;
+                end
+            end
+        end
+    end
+
+    if isempty(s_idx)
+        error('Sensor containing "%s" not found.', name_substr);
+    end
+
+    ax = get_type(imud, 'accelDataX', s_idx);
+    ay = get_type(imud, 'accelDataY', s_idx);
+    az = get_type(imud, 'accelDataZ', s_idx);
+    gx = get_type(imud, 'gyroDataX',  s_idx);
+    gy = get_type(imud, 'gyroDataY',  s_idx);
+    gz = get_type(imud, 'gyroDataZ',  s_idx);
+    mx = get_type(imud, 'magnetDataX',s_idx);
+    my = get_type(imud, 'magnetDataY',s_idx);
+    mz = get_type(imud, 'magnetDataZ',s_idx);
+
+    accel = [ax ay az];
+    gyro  = [gx gy gz];
+
+    mag = [];
+    if ~isempty(mx) && ~isempty(my) && ~isempty(mz)
+        M = [mx my mz];
+        if ~all(abs(M(:)) < 1e-12)
+            mag = M;
+        end
+    end
+
+    sensor.accel = accel;
+    sensor.gyro  = gyro;
+    sensor.mag   = mag;
+    sensor.s_idx = s_idx;
+end
+
+function v = get_type(imud, lbl, s_idx)
+    idx = [];
+    for i = 1:numel(imud.types)
+        if contains(lower(imud.types{i}), lower(lbl))
+            idx = i; break;
+        end
+    end
+    if isempty(idx)
+        v = [];
+    else
+        v = squeeze(imud.data_array(idx,:,s_idx)).';
+    end
+end
+
+function name = get_filename(path)
+    [~, name, ext] = fileparts(path);
+    name = [name ext];
+end
+
+function base = get_basename(path)
+    [~, base] = fileparts(path);
+end
+
+function [idxGlobal, rVal, yVal, thVal] = pick_hit( ...
+        hs0, hs1, to0, rho_lp, y_lp, theta, fs, whichHalf) %#ok<INUSD>
+% Picks the point of maximum horizontal radius in posterior or anterior half.
+% whichHalf = 'A' (anterior: TO→HS1) or 'P' (posterior: HS0→TO)
+
+    if whichHalf == 'A'
+        s0 = to0;
+        s1 = hs1;
+    else
+        s0 = hs0;
+        s1 = to0;
+    end
+
+    % Safety: if indices are degenerate, just return the start sample
+    if s1 <= s0
+        idxGlobal = s0;
+        rVal  = rho_lp(s0);
+        yVal  = y_lp(s0);
+        thVal = theta(s0);
+        return;
+    end
+
+    seg_idx = s0:s1;
+    rL  = rho_lp(seg_idx);
+    yL  = y_lp(seg_idx);
+    thL = theta(seg_idx);
+
+    if isempty(rL)
+        idxLocal = 1;
+    else
+        [~, idxLocal] = max(rL);
+    end
+
+    rVal  = rL(idxLocal);
+    yVal  = yL(idxLocal);
+    thVal = thL(idxLocal);
+    idxGlobal = seg_idx(idxLocal);
+end
