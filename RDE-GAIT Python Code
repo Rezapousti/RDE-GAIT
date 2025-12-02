@@ -1,0 +1,977 @@
+"""
+RDE-GAIT single-leg, auto-calibrating (MAT + APDM).
+"""
+
+import os, json, math, ast
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass
+from typing import Dict
+
+# GUI
+import tkinter as tk
+from tkinter import filedialog, messagebox, simpledialog
+
+# Signal processing
+from scipy.signal import butter, filtfilt, welch, find_peaks
+from scipy.ndimage import uniform_filter1d
+
+# MAT/H5 readers
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+try:
+    import h5py
+except Exception:
+    h5py = None
+try:
+    from scipy.io import loadmat
+except Exception:
+    loadmat = None
+
+# APDM sensor-ID mapping for this setup
+APDM_ID_MAP = {
+    'left':  '13340',
+    'right': '13350',
+    'lumbar':'13378',
+}
+
+# filters
+def butter_bandpass(low, high, fs, order=4):
+    ny = 0.5 * fs
+    if low is not None and high is not None:
+        b, a = butter(order, [low / ny, high / ny], btype="band")
+    elif low is not None:
+        b, a = butter(order, low / ny, btype="high")
+    else:
+        b, a = butter(order, high / ny, btype="low")
+    return b, a
+
+
+def bp(x, fs, lo=0.5, hi=6.0, order=4):
+    if x.ndim == 1:
+        x = x[:, None]
+    b, a = butter_bandpass(lo, hi, fs, order)
+    return filtfilt(b, a, x, axis=0).squeeze()
+
+
+def lp(x, fs, cutoff=6.0, order=4):
+    if x.ndim == 1:
+        x = x[:, None]
+    b, a = butter_bandpass(None, cutoff, fs, order)
+    return filtfilt(b, a, x, axis=0).squeeze()
+
+
+# quaternions (minimal)
+def euler_to_quat(roll, pitch, yaw):
+    cr, sr = np.cos(roll / 2), np.sin(roll / 2)
+    cp, sp = np.cos(pitch / 2), np.sin(pitch / 2)
+    cy, sy = np.cos(yaw / 2), np.sin(yaw / 2)
+    w = cy * cp * cr + sy * sp * sr
+    x = cy * cp * sr - sy * sp * cr
+    y = sy * cp * sr + cy * sp * cr
+    z = sy * cp * cr - cy * sp * sr
+    return np.array([w, x, y, z])
+
+
+def quat_mul(q1, q2):
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return np.array([
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+    ])
+
+
+def quat_norm(q):
+    return q / (np.linalg.norm(q) + 1e-12)
+
+
+def quat_from_gyro(omega, dt):
+    ang = np.linalg.norm(omega) * dt
+    if ang < 1e-9:
+        return np.array([1.0, 0, 0, 0])
+    ax = omega / (np.linalg.norm(omega) + 1e-12)
+    s = math.sin(ang / 2)
+    return np.array([math.cos(ang / 2), ax[0] * s, ax[1] * s, ax[2] * s])
+
+
+def quat_to_R(q):
+    w, x, y, z = q
+    return np.array([
+        [1 - 2 * (y * y + z * z),     2 * (x * y - z * w),     2 * (x * z + y * w)],
+        [2 * (x * y + z * w),         1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w),         2 * (y * z + x * w),     1 - 2 * (x * x + y * y)]
+    ])
+
+
+def wrap(a):
+    return (a + np.pi) % (2 * np.pi) - np.pi
+
+
+def acc_to_roll_pitch(ax, ay, az):
+    roll = np.arctan2(ay, az)
+    pitch = np.arctan2(-ax, np.sqrt(ay * ay + az * az))
+    return roll, pitch
+
+
+def tiltcomp_yaw(mx, my, mz, roll, pitch):
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    mx2 = mx * cp + mz * sp
+    my2 = mx * sr * sp + my * cr - mz * sr * cp
+    return np.arctan2(-my2, mx2)
+
+
+def comp_filter(acc, gyro, mag, fs, alpha=0.02):
+    N = len(acc)
+    q = np.zeros((N, 4))
+    dt = 1.0 / fs
+
+    r0, p0 = acc_to_roll_pitch(*acc[0])
+    if mag is not None:
+        y0 = tiltcomp_yaw(*mag[0], r0, p0)
+    else:
+        y0 = 0.0
+    q[0] = quat_norm(euler_to_quat(r0, p0, y0))
+
+    for k in range(1, N):
+        qpred = quat_norm(quat_mul(q[k - 1], quat_from_gyro(gyro[k], dt)))
+        R = quat_to_R(qpred)
+        yaw_p = np.arctan2(R[1, 0], R[0, 0])
+        pitch_p = np.arcsin(-R[2, 0])
+        roll_p = np.arctan2(R[2, 1], R[2, 2])
+
+        rA, pA = acc_to_roll_pitch(*acc[k])
+        yA = tiltcomp_yaw(*mag[k], rA, pA) if mag is not None else yaw_p
+
+        er, ep, ey = wrap(rA - roll_p), wrap(pA - pitch_p), wrap(yA - yaw_p)
+        qc = euler_to_quat(er * alpha, ep * alpha, ey * alpha)
+        q[k] = quat_norm(quat_mul(qc, qpred))
+    return q
+
+
+# reference helpers
+def yaw_from_quat_seq(quat: np.ndarray) -> np.ndarray:
+    y = np.empty(len(quat))
+    for i in range(len(quat)):
+        R = quat_to_R(quat[i])
+        y[i] = math.atan2(R[1, 0], R[0, 0])
+    return y
+
+
+def rotz(angle: float) -> np.ndarray:
+    c, s = math.cos(angle), math.sin(angle)
+    return np.array([[c, -s, 0],
+                     [s,  c, 0],
+                     [0,  0, 1]], dtype=float)
+
+
+# IMU container
+class IMUData:
+    def __init__(self, fs, t, sensors, types, dataArray):
+        self.fs = fs
+        self.t = t
+        self.sensors = sensors
+        self.types = types
+        self.data_array = dataArray
+
+
+def _parse_axis_value_entry(val):
+    if isinstance(val, (list, tuple, np.ndarray)):
+        return [str(x) for x in list(val)]
+    if isinstance(val, str):
+        s = val.strip()
+        if s.startswith('[') and s.endswith(']'):
+            try:
+                parsed = ast.literal_eval(s)
+                return [str(x) for x in parsed]
+            except Exception:
+                return [s]
+        return [s]
+    return [str(val)]
+
+
+# APDM H5 loader
+def load_apdm_h5(path) -> IMUData:
+    if h5py is None:
+        raise RuntimeError("h5py not available to read APDM .h5 file.")
+
+    with h5py.File(path, 'r') as f:
+        if '/Sensors' not in f:
+            raise RuntimeError("APDM H5: '/Sensors' group not found.")
+
+        sensor_ids = sorted(list(f['/Sensors'].keys()))
+
+        # Sampling rate from Time (microseconds)
+        t_us = f[f'/Sensors/{sensor_ids[0]}/Time'][:].astype(np.float64)
+        dt = np.diff(t_us)
+        med = float(np.median(dt))
+        if med <= 0:
+            raise RuntimeError('APDM H5: Non-positive median time step.')
+        fs = 1e6 / med
+
+        # Align lengths across sensors
+        N = min([f[f'/Sensors/{sid}/Accelerometer'].shape[0] for sid in sensor_ids])
+
+        # Build dataArray in the same layout expected by the original code
+        types = [
+            'accelDataX', 'accelDataY', 'accelDataZ',
+            'gyroDataX', 'gyroDataY', 'gyroDataZ',
+            'magnetDataX', 'magnetDataY', 'magnetDataZ'
+        ]
+        dataArray = np.zeros((len(types), N, len(sensor_ids)), dtype=np.float64)
+
+        for sidx, sid in enumerate(sensor_ids):
+            acc = f[f'/Sensors/{sid}/Accelerometer'][:N]
+            gyr = f[f'/Sensors/{sid}/Gyroscope'][:N]
+            has_mag = f.get(f'/Sensors/{sid}/Magnetometer') is not None
+            if has_mag:
+                mag = f[f'/Sensors/{sid}/Magnetometer'][:N]
+            else:
+                mag = np.zeros_like(acc)
+
+            dataArray[0:3, :, sidx] = acc.T
+            dataArray[3:6, :, sidx] = gyr.T
+            dataArray[6:9, :, sidx] = mag.T
+
+        t = (t_us[:N] / 1e6).astype(np.float64)
+        sensors = [str(sid) for sid in sensor_ids]
+        return IMUData(fs, t, sensors, types, dataArray)
+
+
+# MAT loader (unchanged API)
+def load_imu_mat(path) -> IMUData:
+    # Route APDM .h5 files to APDM loader
+    if str(path).lower().endswith('.h5'):
+        return load_apdm_h5(path)
+
+    # Try h5py first (v7.3 MAT)
+    if h5py is not None:
+        try:
+            with h5py.File(path, 'r') as f:
+                g = f['IMU']
+                fs = float(np.array(g['samplingRate']))
+                dataArray = np.array(g['dataArray'])
+                axisValue = []
+                for i in range(g['axisValue'].shape[0]):
+                    s = ''.join(chr(c) for c in g['axisValue'][i][:].flatten())
+                    axisValue.append(s)
+                types = _parse_axis_value_entry(axisValue[0])
+                sensors = _parse_axis_value_entry(axisValue[2])
+                N = dataArray.shape[1]
+                t = np.arange(N) / fs
+                return IMUData(fs, t, sensors, types, dataArray)
+        except Exception:
+            pass
+
+    # Fallback (v5 MAT)
+    if loadmat is None:
+        raise RuntimeError("Could not load MAT file.")
+
+    m = loadmat(path, squeeze_me=True, struct_as_record=False)
+    if 'IMU' not in m:
+        raise RuntimeError("Unsupported MAT layout: 'IMU' struct not found.")
+
+    IMU = m['IMU']
+    fs = float(getattr(IMU, 'samplingRate'))
+    dataArray = np.array(getattr(IMU, 'dataArray'))
+    axisValue = getattr(IMU, 'axisValue')
+    types = _parse_axis_value_entry(axisValue[0])
+    sensors = _parse_axis_value_entry(axisValue[2])
+    N = dataArray.shape[1]
+    t = np.arange(N) / fs
+    return IMUData(fs, t, sensors, types, dataArray)
+
+
+def extract_sensor(imud: IMUData, name_substr: str) -> Dict[str, np.ndarray]:
+    # First try direct substring match
+    s_idx = None
+    for i, s in enumerate(imud.sensors):
+        if name_substr.lower() in s.lower():
+            s_idx = i
+            break
+
+    # APDM convenience: allow logical labels 'left'/'right'/'lumbar'
+    if s_idx is None:
+        key = name_substr.strip().lower()
+        if key in APDM_ID_MAP:
+            target = APDM_ID_MAP[key]
+            for i, s in enumerate(imud.sensors):
+                if s == target:
+                    s_idx = i
+                    break
+
+    # APDM convenience: allow numeric IDs with leading '#' or spaces
+    if s_idx is None:
+        key = name_substr.strip().lstrip('#')
+        for i, s in enumerate(imud.sensors):
+            if s == key:
+                s_idx = i
+                break
+
+    if s_idx is None:
+        raise ValueError(
+            f"Sensor containing '{name_substr}' not found. Available: {imud.sensors}"
+        )
+
+    def tidx(lbl):
+        for i, t in enumerate(imud.types):
+            if lbl.lower() in t.lower():
+                return i
+        return None
+
+    ax = imud.data_array[tidx('accelDataX'), :, s_idx]
+    ay = imud.data_array[tidx('accelDataY'), :, s_idx]
+    az = imud.data_array[tidx('accelDataZ'), :, s_idx]
+    gx = imud.data_array[tidx('gyroDataX'), :, s_idx]
+    gy = imud.data_array[tidx('gyroDataY'), :, s_idx]
+    gz = imud.data_array[tidx('gyroDataZ'), :, s_idx]
+    mx = imud.data_array[tidx('magnetDataX'), :, s_idx]
+    my = imud.data_array[tidx('magnetDataY'), :, s_idx]
+    mz = imud.data_array[tidx('magnetDataZ'), :, s_idx]
+
+    mag = None
+    if mx is not None and my is not None and mz is not None:
+        M = np.c_[mx, my, mz]
+        if not np.allclose(M, 0.0):
+            mag = M
+
+    return dict(accel=np.c_[ax, ay, az],
+                gyro=np.c_[gx, gy, gz],
+                mag=mag,
+                s_idx=s_idx)
+
+
+# helpers for stance, axis
+def gyromag(g):
+    return np.linalg.norm(g, axis=1)
+
+
+def stance_mask(gyro, fs, thr=0.35, min_dur=0.3):
+    m = gyromag(gyro)
+    raw = (m < thr).astype(float)
+    K = max(1, int(min_dur * fs))
+    sm = uniform_filter1d(raw, size=K, mode='nearest')
+    return sm > 0.8
+
+
+def estimate_unit_shank_axis_sensor(acc, gyro, fs):
+    mask = stance_mask(gyro, fs)
+    if mask.sum() < fs:
+        gvec = acc.mean(axis=0)
+    else:
+        gvec = acc[mask].mean(axis=0)
+    u = -gvec / (np.linalg.norm(gvec) + 1e-12)
+    return u
+
+
+# event detection
+def primary_gyro_axis(gyro, fs):
+    powb = []
+    for i in range(3):
+        f, P = welch(gyro[:, i], fs=fs, nperseg=min(4096, len(gyro)))
+        band = (f >= 0.5) & (f <= 3.0)
+        powb.append(P[band].sum())
+    idx = int(np.argmax(powb))
+    return idx
+
+
+def detect_HS_TO(gyro, fs):
+    idx = primary_gyro_axis(gyro, fs)
+    sig = bp(gyro[:, idx], fs, 0.5, 6.0, 4)
+    TO, _ = find_peaks(sig, prominence=np.std(sig) * 0.5, distance=int(0.3 * fs))
+    HS, _ = find_peaks(-sig, prominence=np.std(sig) * 0.5, distance=int(0.3 * fs))
+    HS = np.sort(HS)
+    TO = np.sort(TO)
+
+    hs_list, to_list = [], []
+    j = 0
+    for k in range(len(HS) - 1):
+        hs0, hs1 = HS[k], HS[k + 1]
+        while j < len(TO) and TO[j] <= hs0:
+            j += 1
+        if j < len(TO) and hs0 < TO[j] < hs1:
+            hs_list.append(hs0)
+            to_list.append(TO[j])
+
+    return np.array(hs_list), np.array(to_list)
+
+
+# leg length estimators
+def estimate_leg_length_from_theta_freq(theta, fs, bounds=(0.50, 1.10)):
+    g = 9.80665
+    f, Pxx = welch(theta, fs=fs, nperseg=min(4096, len(theta)))
+    band = (f >= 0.4) & (f <= 1.2)
+    if not np.any(band) or Pxx[band].sum() == 0:
+        return 0.85
+    fpk = f[band][np.argmax(Pxx[band])]
+    h = g / ((2 * np.pi * fpk) ** 2 + 1e-12)
+    return float(np.clip(h, bounds[0], bounds[1]))
+
+
+def estimate_leg_length_hybrid(theta, fs, HS, TO, bounds=(0.50, 1.10)):
+    g = 9.80665
+    th = lp(theta, fs, cutoff=8.0)
+    dth = np.gradient(th, 1.0 / fs)
+    dth = lp(dth, fs, cutoff=8.0)
+
+    h_vals = []
+    nwin = min(len(HS) - 1, len(TO))
+    for k in range(nwin):
+        hs0, to0, hs1 = HS[k], TO[k], HS[k + 1]
+        for s0, s1 in ((hs0, to0), (to0, hs1)):
+            if not (0 <= s0 < s1 <= len(th) - 1):
+                continue
+            seg_th = th[s0:s1]
+            seg_dth = dth[s0:s1]
+            if len(seg_th) < max(5, int(0.1 * fs)):
+                continue
+            th_max = float(np.max(seg_th))
+            th_min = float(np.min(seg_th))
+            cosdiff = np.cos(th_min) - np.cos(th_max)
+            wmax = float(np.max(np.abs(seg_dth)))
+            if cosdiff <= 1e-4 or wmax <= 1e-3:
+                continue
+            h_i = (2.0 * g * cosdiff) / (wmax * wmax + 1e-12)
+            if 0.35 <= h_i <= 1.40:
+                h_vals.append(h_i)
+
+    if len(h_vals) >= 30:
+        h_vals = np.array(h_vals, dtype=float)
+        lo, hi = np.percentile(h_vals, [10, 90])
+        trimmed = h_vals[(h_vals >= lo) & (h_vals <= hi)]
+        if len(trimmed) >= 10:
+            return float(np.clip(np.median(trimmed), bounds[0], bounds[1]))
+
+    return estimate_leg_length_from_theta_freq(theta, fs, bounds=bounds)
+
+
+# RDE core
+@dataclass
+class RDEConfig:
+    tau_min_frac: float = 0.10
+    comp_alpha: float = 0.02
+    # Baseline settings
+    baseline_mode: str = "rolling"    # "rolling" or "trimmed"
+    trim_frac: float = 0.10           # 10% tails trimmed for session median
+    rolling_window: int = 200         # cycles, for rolling baseline (if used)
+
+
+# running stats for plots
+def running_stats(x: np.ndarray, win: int = 201):
+    s = pd.Series(x)
+    med = s.rolling(win, center=True,
+                    min_periods=max(3, win // 4)).median().to_numpy()
+    q10 = s.rolling(win, center=True,
+                    min_periods=max(3, win // 4)).quantile(0.10).to_numpy()
+    q90 = s.rolling(win, center=True,
+                    min_periods=max(3, win // 4)).quantile(0.90).to_numpy()
+    return med, q10, q90
+
+
+# plotting (E + alpha histogram + three scatters + stats)
+def plot_rde(df: pd.DataFrame, out_png: str, summary: dict, cfg: RDEConfig):
+    import matplotlib.pyplot as plt
+    plt.style.use("seaborn-v0_8-whitegrid")
+
+    # Colors by class
+    C = {
+        "consistent":       "#d946ef",
+        "inconsistent":     "#94a3b8",
+        "semi-consistent":  "#8b5e3c",
+    }
+
+    cyc = df["cycle"].to_numpy()
+    E = df["E"].to_numpy()
+    cos = df["cosine"].to_numpy()
+    alpha = np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))
+    cls = df["class"].to_numpy()
+
+    medE, q10E, q90E = running_stats(E, win=201)
+
+    fig = plt.figure(figsize=(14, 9))
+    gs = fig.add_gridspec(
+        3, 4,
+        height_ratios=[1, 1, 1.0],
+        width_ratios=[1, 1, 1, 1],
+        hspace=0.35,
+        wspace=0.25
+    )
+
+    # E panel (row 0, all cols)
+    axE = fig.add_subplot(gs[0, :])
+    axE.fill_between(cyc, q10E, q90E,
+                     color="#ff9f9fe2", alpha=0.6,
+                     label="10–90% band")
+    axE.plot(cyc, E, lw=0.5, color="#2563eb",
+             alpha=0.7, label="E")
+    if np.isfinite(medE).any():
+        axE.plot(cyc, medE, color="#111827",
+                 lw=1.2, label="running median")
+    axE.axhline(1.0, ls="--", color="#6b7280",
+                lw=1.0, label="baseline = 1")
+    axE.set_title("RDE-GAIT Equilibrium per cycle (E)", fontsize=12)
+    axE.set_ylabel("E")
+    axE.legend(loc="lower left", ncol=4, fontsize=9, frameon=True)
+
+    # Alpha histogram (row 1, cols 0–2)
+    axHst = fig.add_subplot(gs[1, 0:3])
+    bins = np.linspace(0, max(30, np.nanpercentile(alpha, 99)), 40)
+    for k, col in [
+        ("consistent", C["consistent"]),
+        ("inconsistent", C["inconsistent"]),
+        ("semi-consistent", C["semi-consistent"])
+    ]:
+        m = (cls == k)
+        if m.any():
+            axHst.hist(
+                alpha[m],
+                bins=bins,
+                alpha=0.6 if k != "inconsistent" else 0.5,
+                color=col,
+                label=f"{k} (n={m.sum()})"
+            )
+    axHst.set_xlabel("α (deg)")
+    axHst.set_ylabel("count")
+    axHst.set_title("Mirror error angle α distribution")
+    axHst.legend(fontsize=9)
+
+    # Stats box (row 1, col 3)
+    axStats = fig.add_subplot(gs[1, 3])
+    axStats.axis("off")
+    txt = []
+    txt.append(
+        f"Baseline: {summary['baseline']['mode']} "
+        f"(trim={summary['baseline']['trim_frac']})"
+    )
+    txt.append(f"h (hybrid): {summary['leg_length_est_m']:.3f} m")
+    txt.append(f"cycles: {summary['n_cycles']}")
+    txt.append(
+        f"E median / IQR: {summary['E_median']:.3f} / "
+        f"{summary['E_IQR']:.3f}"
+    )
+    cnts = summary['counts']
+    txt.append(f"consistent:      {cnts['consistent']}")
+    txt.append(f"inconsistent:    {cnts['inconsistent']}")
+    txt.append(f"semi-consistent: {cnts['semi_consistent']}")
+    txt.append(f"reference: {summary.get('reference_mode', 'world')}")
+    if 'waist_sensor_id' in summary:
+        txt.append(f"waist ID: {summary['waist_sensor_id']}")
+    axStats.text(0.02, 0.98, "\n".join(txt),
+                 va="top", ha="left", fontsize=11)
+
+    # Helper for scatters
+    def scatter_by_class(ax, x, y, xlabel, ylabel):
+        for k in ["consistent", "inconsistent", "semi-consistent"]:
+            m = (cls == k)
+            if not np.any(m):
+                continue
+            ax.scatter(
+                x[m], y[m],
+                s=10 if k == "consistent" else 12,
+                alpha=0.55 if k != "inconsistent" else 0.45,
+                c=C[k],
+                label=f"{k} (n={m.sum()})",
+                edgecolors="none"
+            )
+        mn = np.nanmin([np.nanmin(x), np.nanmin(y)])
+        mx = np.nanmax([np.nanmax(x), np.nanmax(y)])
+        ax.plot([mn, mx], [mn, mx],
+                ls="--", lw=1.0, color="#9ca3af")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_xlim(mn, mx)
+        ax.set_ylim(mn, mx)
+        ax.legend(loc="best", fontsize=8, frameon=True)
+
+    # Three mirror scatters (row 2)
+    axR = fig.add_subplot(gs[2, 0])
+    scatter_by_class(
+        axR,
+        df["rho_A"].to_numpy(),
+        (-df["rho_P"]).to_numpy(),
+        "rho_A",
+        "rho_P mirrored"
+    )
+
+    axT = fig.add_subplot(gs[2, 1])
+    scatter_by_class(
+        axT,
+        df["tau_A"].to_numpy(),
+        (-df["tau_P"]).to_numpy(),
+        "tau_A",
+        "tau_P mirrored"
+    )
+
+    axTh = fig.add_subplot(gs[2, 2])
+    scatter_by_class(
+        axTh,
+        df["theta_A"].to_numpy(),
+        (-df["theta_P"]).to_numpy(),
+        "theta_A",
+        "theta_P mirrored"
+    )
+
+    axEmpty = fig.add_subplot(gs[2, 3])
+    axEmpty.axis("off")
+
+    fig.suptitle("RDE-GAIT — Equilibrium & Mirror Symmetry",
+                 fontsize=14, y=0.98)
+    fig.savefig(out_png, dpi=170, bbox_inches="tight")
+    plt.close(fig)
+
+
+def compute_rde(
+    file_path,
+    out_dir,
+    ankle_name="IMU 3 (left ankle)",
+    cfg: RDEConfig = RDEConfig(),
+    reference_mode: str = 'waist_full'
+):
+    print(f"\n=== Processing: {os.path.basename(file_path)} ===")
+    imud = load_imu_mat(file_path)
+    fs, t = imud.fs, imud.t
+
+    # If APDM .h5 and user left the MAT default, default to LEFT (13340)
+    if str(file_path).lower().endswith('.h5') and ankle_name == "IMU 3 (left ankle)":
+        ankle_name = 'left'
+
+    # Ankle triads
+    ankle = extract_sensor(imud, ankle_name)
+    if ankle['mag'] is not None:
+        ankle['mag'] = uniform_filter1d(
+            ankle['mag'],
+            size=int(max(1, fs * 0.25)),
+            axis=0,
+            mode='nearest'
+        )
+
+    # Orientation (ankle)
+    q_a = comp_filter(
+        ankle['accel'],
+        ankle['gyro'],
+        ankle['mag'],
+        fs,
+        alpha=cfg.comp_alpha
+    )
+    Rw_a = np.stack([quat_to_R(qk) for qk in q_a], axis=0)
+
+    # Auto unit axis from stance gravity (ankle sensor frame)
+    u_sensor = estimate_unit_shank_axis_sensor(
+        ankle['accel'], ankle['gyro'], fs
+    )
+
+    # r_unit_world from ankle alone
+    r_unit_world = np.einsum('nij,j->ni', Rw_a, u_sensor)
+
+    # Optional waist reference (APDM only)
+    waist_info = {}
+    r_ref = r_unit_world
+    if reference_mode in ('waist_yaw', 'waist_full') and str(file_path).lower().endswith('.h5'):
+        try:
+            waist = extract_sensor(imud, 'lumbar')  # 13378 by mapping
+            if waist['mag'] is not None:
+                waist['mag'] = uniform_filter1d(
+                    waist['mag'],
+                    size=int(max(1, fs * 0.25)),
+                    axis=0,
+                    mode='nearest'
+                )
+            q_w = comp_filter(
+                waist['accel'],
+                waist['gyro'],
+                waist['mag'],
+                fs,
+                alpha=cfg.comp_alpha
+            )
+            waist_info['waist_sensor_id'] = APDM_ID_MAP['lumbar']
+
+            if reference_mode == 'waist_yaw':
+                yaws = yaw_from_quat_seq(q_w)
+                r_ref = np.empty_like(r_unit_world)
+                for i in range(len(r_unit_world)):
+                    Rz = rotz(-yaws[i])
+                    r_ref[i] = Rz.dot(r_unit_world[i])
+            else:  # 'waist_full'
+                r_ref = np.empty_like(r_unit_world)
+                for i in range(len(r_unit_world)):
+                    Rw = quat_to_R(q_w[i])  # world_from_waist
+                    r_ref[i] = Rw.T.dot(r_unit_world[i])  # into waist frame
+        except Exception as e:
+            print(f"[WARN] Waist reference requested but failed: {e}. Using 'world'.")
+            reference_mode = 'world'
+            r_ref = r_unit_world
+
+    # Leg vector in chosen reference
+    y_unit = r_ref[:, 1]
+    theta = np.arccos(np.clip(
+        y_unit / (np.linalg.norm(r_ref, axis=1) + 1e-12),
+        -1, 1
+    ))
+    theta = lp(theta, fs, cutoff=6.0)
+
+    # Events (needed for hybrid length estimator)
+    HS, TO = detect_HS_TO(ankle['gyro'], fs)
+    if len(HS) < 3 or len(TO) < 2:
+        print("Not enough HS/TO events detected; try a different recording.")
+        return
+
+    # Auto leg length from hybrid estimator
+    h_est = estimate_leg_length_hybrid(
+        theta, fs, HS, TO, bounds=(0.50, 1.10)
+    )
+
+    # Final r(t)
+    r_world = r_ref * h_est
+    x, yv, z = r_world[:, 0], r_world[:, 1], r_world[:, 2]
+    rho = np.sqrt(x * x + z * z)
+    rho_lp = lp(rho, fs, cutoff=6.0)
+    y_lp = lp(yv, fs, cutoff=6.0)
+
+    # Cycles
+    rows = []
+    for k in range(min(len(HS) - 1, len(TO))):
+        hs0, to0, hs1 = HS[k], TO[k], HS[k + 1]
+        if not (hs0 < to0 < hs1):
+            continue
+        sl = slice(hs0, hs1)
+        rho_c = rho_lp[sl]
+        RT = float(np.nanmax(rho_c) - np.nanmin(rho_c))
+        if RT <= 1e-6:
+            continue
+
+        # posterior: hs0→to0 ; anterior: to0→hs1
+        def pick_hit(s0, s1):
+            s = slice(s0, s1)
+            rL, yL, thL = rho_lp[s], y_lp[s], theta[s]
+            peaks, _ = find_peaks(rL, distance=int(0.2 * fs))
+            if len(peaks) == 0:
+                idx = int(np.argmax(rL))
+            else:
+                idx = int(peaks[np.argmax(rL[peaks])])
+            return idx, float(rL[idx]), float(yL[idx]), float(thL[idx])
+
+        iA, rhoA, yA, thA = pick_hit(to0, hs1)
+        iP, rhoP, yP, thP = pick_hit(hs0, to0)
+
+        y_stance = float(np.nanpercentile(y_lp[sl], 10))
+        tauA = yA - y_stance
+        tauP = yP - y_stance
+
+        # ML sign from z at hits
+        zA = float(z[to0 + iA])
+        zP = float(z[hs0 + iP])
+
+        rows.append(dict(
+            cycle=k,
+            t_HS0=t[hs0], t_TO=t[to0], t_HS1=t[hs1],
+            rho_A=rhoA, tau_A=tauA, theta_A=thA, ml_A=zA,
+            rho_P=-rhoP, tau_P=-tauP, theta_P=-thP, ml_P=zP,
+            RT=RT
+        ))
+
+    if not rows:
+        print("No valid cycles extracted.")
+        return
+
+    df = pd.DataFrame(rows)
+
+    # Equilibrium Index
+    def MAD(x):
+        med = np.median(x)
+        return np.median(np.abs(x - med)) + 1e-12
+
+    w_rho = 1.0 / MAD(np.r_[df['rho_A'], df['rho_P']])
+    w_tau = 1.0 / MAD(np.r_[df['tau_A'], df['tau_P']])
+    w_th = 1.0 / MAD(np.r_[df['theta_A'], df['theta_P']])
+
+    def norm_triplet(r, t, h):
+        v = np.array([r * w_rho, t * w_tau, h * w_th])
+        v /= (np.linalg.norm(v) + 1e-12)
+        return v
+
+    vA = np.vstack([
+        norm_triplet(r, t, h)
+        for r, t, h in zip(df['rho_A'], df['tau_A'], df['theta_A'])
+    ])
+    vPm = np.vstack([
+        norm_triplet(-r, -t, -h)
+        for r, t, h in zip(df['rho_P'], df['tau_P'], df['theta_P'])
+    ])
+
+    cos = np.einsum('ij,ij->i', vA, vPm)
+    p = (1.0 + cos) / 2.0
+
+    # Robust baseline p0 (rolling or trimmed)
+    if cfg.baseline_mode.lower() == "rolling":
+        p_series = pd.Series(p)
+        p0_arr = p_series.rolling(
+            window=int(max(5, cfg.rolling_window)),
+            center=True,
+            min_periods=int(max(3, cfg.rolling_window // 4))
+        ).median().to_numpy()
+        lo, hi = np.percentile(
+            p,
+            [100 * cfg.trim_frac, 100 * (1 - cfg.trim_frac)]
+        )
+        trimmed_mask = (p >= lo) & (p <= hi)
+        global_trim_med = (
+            np.median(p[trimmed_mask])
+            if trimmed_mask.any()
+            else np.median(p)
+        )
+        p0_arr = np.where(np.isfinite(p0_arr), p0_arr, global_trim_med)
+        E = p / (p0_arr + 1e-12)
+    else:
+        lo, hi = np.percentile(
+            p,
+            [100 * cfg.trim_frac, 100 * (1 - cfg.trim_frac)]
+        )
+        mask = (p >= lo) & (p <= hi)
+        p0 = np.median(p[mask]) if mask.any() else np.median(p)
+        E = p / (p0 + 1e-12)
+
+    df['cosine'] = cos
+    df['p'] = p
+    df['E'] = E
+
+    # Class labels:
+    #   E ~ 1.0      → 'consistent'
+    #   E < 0.95     → 'inconsistent'
+    #   E > 1.05     → 'semi-consistent'
+    df['class'] = np.where(
+        E > 1.05, 'semi-consistent',
+        np.where(E < 0.95, 'inconsistent', 'consistent')
+    )
+
+    # Save tables
+    base = os.path.splitext(os.path.basename(file_path))[0]
+    csv_path = os.path.join(out_dir, f"{base}__RDE-GAIT_cycles.csv")
+    json_path = os.path.join(out_dir, f"{base}__RDE-GAIT_summary.json")
+    plot_path = os.path.join(out_dir, f"{base}__RDE-GAIT_plots.png")
+    df.to_csv(csv_path, index=False)
+
+    summary = dict(
+        file=file_path,
+        fs=float(fs),
+        n_cycles=int(len(df)),
+        leg_length_est_m=float(h_est),
+        shank_axis_sensor=estimate_unit_shank_axis_sensor(
+            ankle['accel'], ankle['gyro'], fs
+        ).tolist(),
+        E_median=float(np.median(E)),
+        E_IQR=float(
+            np.percentile(E, 75) - np.percentile(E, 25)
+        ),
+        counts=dict(
+            consistent=int((df['class'] == 'consistent').sum()),
+            semi_consistent=int(
+                (df['class'] == 'semi-consistent').sum()
+            ),
+            inconsistent=int(
+                (df['class'] == 'inconsistent').sum()
+            )
+        ),
+        weights=dict(
+            w_rho=float(w_rho),
+            w_tau=float(w_tau),
+            w_theta=float(w_th)
+        ),
+        baseline=dict(
+            mode=cfg.baseline_mode,
+            trim_frac=cfg.trim_frac,
+            rolling_window=cfg.rolling_window
+        ),
+        reference_mode=reference_mode
+    )
+    summary.update(waist_info)
+    with open(json_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+
+    # Plot
+    plot_rde(df, plot_path, summary, cfg)
+
+    print(f"Saved:\n  {csv_path}\n  {json_path}\n  {plot_path}")
+    print(
+        f"Hybrid h = {h_est:.3f} m; "
+        f"baseline mode = {cfg.baseline_mode}; "
+        f"reference = {reference_mode}"
+    )
+
+
+# UI
+def main():
+    root = tk.Tk()
+    root.withdraw()
+
+    messagebox.showinfo(
+        "RDE-GAIT",
+        "Select one or more IMU .mat or APDM .h5 files."
+    )
+    files = filedialog.askopenfilenames(
+        title="Select IMU .mat or APDM .h5 file(s)",
+        filetypes=[
+            ("MATLAB files", "*.mat"),
+            ("APDM HDF5", "*.h5"),
+            ("All files", "*.*")
+        ]
+    )
+    if not files:
+        return
+
+    out_dir = filedialog.askdirectory(title="Select output folder")
+    if not out_dir:
+        return
+
+    # Ankle sensor hint. For APDM, default will auto-map to 'left' if unchanged.
+    ankle_hint = simpledialog.askstring(
+        "Ankle sensor name contains",
+        "For MAT: substring like 'IMU 3 (left ankle)'.\n"
+        "For APDM: type 'left', 'right', 'lumbar' or 13340/13350/13378.\n"
+        "(Default: 'left' for APDM, original default for MAT)",
+        initialvalue="IMU 3 (left ankle)"
+    ) or "IMU 3 (left ankle)"
+
+    # Reference mode selection (default = waist_full)
+    ref = simpledialog.askstring(
+        "Reference mode",
+        "Enter reference: 'waist_full' (default), 'world', or 'waist_yaw'",
+        initialvalue='waist_full'
+    ) or 'waist_full'
+    ref = (ref or 'waist_full').strip().lower()
+    if ref not in ('world', 'waist_yaw', 'waist_full'):
+        ref = 'waist_full'
+
+    # Baseline mode selection (default = rolling)
+    mode = simpledialog.askstring(
+        "Baseline mode",
+        "Enter baseline mode: 'rolling' (default) or 'trimmed'",
+        initialvalue="rolling"
+    ) or "rolling"
+    mode = mode.strip().lower()
+    if mode not in ("trimmed", "rolling"):
+        mode = "rolling"
+
+    cfg = RDEConfig(baseline_mode=mode)
+
+    for f in files:
+        try:
+            ankle_arg = ankle_hint
+            if str(f).lower().endswith('.h5') and ankle_hint == "IMU 3 (left ankle)":
+                ankle_arg = 'left'  # maps to 13340
+            compute_rde(
+                f,
+                out_dir,
+                ankle_name=ankle_arg,
+                cfg=cfg,
+                reference_mode=ref
+            )
+        except Exception as e:
+            print(f"[ERROR] {os.path.basename(f)}: {e}")
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
