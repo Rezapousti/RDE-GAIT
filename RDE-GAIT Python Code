@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 RDE-GAIT single-leg, auto-calibrating (MAT + APDM).
 """
@@ -478,9 +480,9 @@ def plot_rde(df: pd.DataFrame, out_png: str, summary: dict, cfg: RDEConfig):
 
     # Colors by class
     C = {
-        "consistent":       "#d946ef",
+        "consistent":       "#8b5e3c",
         "inconsistent":     "#94a3b8",
-        "semi-consistent":  "#8b5e3c",
+        "semi-consistent":  "#d946ef",
     }
 
     cyc = df["cycle"].to_numpy()
@@ -838,12 +840,12 @@ def compute_rde(
     df['E'] = E
 
     # Class labels:
-    #   E ~ 1.0      → 'consistent'
+    #   E ~ 1.0      → 'semi-consistent'
     #   E < 0.95     → 'inconsistent'
-    #   E > 1.05     → 'semi-consistent'
+    #   E > 1.05     → 'consistent'
     df['class'] = np.where(
-        E > 1.05, 'semi-consistent',
-        np.where(E < 0.95, 'inconsistent', 'consistent')
+        E > 1.05, 'consistent',
+        np.where(E < 0.95, 'inconsistent', 'semi-consistent')
     )
 
     # Save tables
