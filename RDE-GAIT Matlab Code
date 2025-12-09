@@ -271,10 +271,15 @@ function compute_rde(file_path, out_dir, ankle_name, cfg, reference_mode)
     df.p      = p;
     df.E      = E;
 
-    cls = repmat("consistent", nRows, 1);
+    % ---------- CLASS LOGIC UPDATED TO MATCH PYTHON ----------
+    % E ~ 1.0      → semi-consistent
+    % E < 0.95     → inconsistent
+    % E > 1.05     → consistent
+    cls = repmat("semi-consistent", nRows, 1);
     cls(E < 0.95) = "inconsistent";
-    cls(E > 1.05) = "semi-consistent";
+    cls(E > 1.05) = "consistent";
     df.class = cls;
+    % --------------------------------------------------------
 
     % Save CSV + JSON + plot
     base = get_basename(file_path);
@@ -345,9 +350,14 @@ function plot_rde(df, out_png, summary, cfg) %#ok<INUSD>
 
     [medE, q10E, q90E] = running_stats(E, 201);
 
-    C.consistent      = [0.85 0.28 0.94];
-    C.inconsistent    = [0.58 0.64 0.70];
-    C.semi_consistent = [0.55 0.37 0.24];
+    % ---------- COLOR MAP UPDATED TO MATCH PYTHON ----------
+    % semi-consistent: pink
+    % consistent     : brown
+    % inconsistent   : light gray/white
+    C.consistent      = [0.55 0.37 0.24];  % brown
+    C.inconsistent    = [0.90 0.90 0.90];  % light gray/white
+    C.semi_consistent = [0.85 0.28 0.94];  % pink
+    % ------------------------------------------------------
 
     figure('Visible','off','Position',[100 100 1200 700]);
     tiledlayout(3,4,'Padding','compact','TileSpacing','compact');
