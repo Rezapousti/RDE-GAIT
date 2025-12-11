@@ -60,9 +60,7 @@ function RDE_GAIT_main
 end
 
 
-% =====================================================================
 % Configuration
-% =====================================================================
 function cfg = RDEConfig()
     cfg.tau_min_frac   = 0.10;
     cfg.comp_alpha     = 0.02;
@@ -72,9 +70,7 @@ function cfg = RDEConfig()
 end
 
 
-% =====================================================================
 % Core compute function
-% =====================================================================
 function compute_rde(file_path, out_dir, ankle_name, cfg, reference_mode)
     fprintf('\n=== Processing: %s ===\n', get_filename(file_path));
 
@@ -271,7 +267,7 @@ function compute_rde(file_path, out_dir, ankle_name, cfg, reference_mode)
     df.p      = p;
     df.E      = E;
 
-    % ---------- CLASS LOGIC UPDATED TO MATCH PYTHON ----------
+    % CLASS LOGIC UPDATED TO MATCH PYTHON
     % E ~ 1.0      → semi-consistent
     % E < 0.95     → inconsistent
     % E > 1.05     → consistent
@@ -279,7 +275,7 @@ function compute_rde(file_path, out_dir, ankle_name, cfg, reference_mode)
     cls(E < 0.95) = "inconsistent";
     cls(E > 1.05) = "consistent";
     df.class = cls;
-    % --------------------------------------------------------
+    
 
     % Save CSV + JSON + plot
     base = get_basename(file_path);
@@ -338,9 +334,7 @@ function compute_rde(file_path, out_dir, ankle_name, cfg, reference_mode)
 end
 
 
-% =====================================================================
 % Plotting
-% =====================================================================
 function plot_rde(df, out_png, summary, cfg) %#ok<INUSD>
     cyc   = df.cycle;
     E     = df.E;
@@ -350,14 +344,13 @@ function plot_rde(df, out_png, summary, cfg) %#ok<INUSD>
 
     [medE, q10E, q90E] = running_stats(E, 201);
 
-    % ---------- COLOR MAP UPDATED TO MATCH PYTHON ----------
+    % COLOR MAP UPDATED TO MATCH PYTHON
     % semi-consistent: pink
     % consistent     : brown
     % inconsistent   : light gray/white
     C.consistent      = [0.55 0.37 0.24];  % brown
     C.inconsistent    = [0.90 0.90 0.90];  % light gray/white
     C.semi_consistent = [0.85 0.28 0.94];  % pink
-    % ------------------------------------------------------
 
     figure('Visible','off','Position',[100 100 1200 700]);
     tiledlayout(3,4,'Padding','compact','TileSpacing','compact');
@@ -471,9 +464,7 @@ function plot_rde(df, out_png, summary, cfg) %#ok<INUSD>
 end
 
 
-% =====================================================================
 % Small helpers
-% =====================================================================
 function y = bp(x, fs, lo, hi, order)
     if nargin < 5, order = 4; end
     ny = 0.5 * fs;
